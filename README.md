@@ -263,7 +263,7 @@ ngrok http 5000
 
 **Architected & Maintained by:**
 ### **Leela Ranga Prasad**
-*AI Engineer & Data Science Undergraduate • Smart India Hackathon Lead • Google Student Representative*
+*AI Engineer & Data Science Undergraduate • Google Student Representative*
 
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white)](https://linkedin.com/in/leela-ranga-prasad-ba4936214)
 [![GitHub](https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/nleelaranga-ai)
