@@ -1,0 +1,1438 @@
+# app.py
+
+from flask import Flask, request, redirect, session, url_for
+import requests
+import os
+import time
+from datetime import datetime, timedelta
+import json
+import re
+from fpdf import FPDF
+from werkzeug.utils import secure_filename
+from pdf2docx import Converter
+import fitz  # PyMuPDF
+import pytz
+from docx import Document
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.jobstores.mongodb import MongoDBJobStore
+from dateutil import parser as date_parser
+import pandas as pd
+from werkzeug.middleware.proxy_fix import ProxyFix
+from pymongo import MongoClient
+from urllib.parse import urlparse
+import pickle
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+import mimetypes
+from googleapiclient.discovery import build
+
+
+from currency import convert_currency
+# Imported new email function and transcription function
+from grok_ai import (
+    route_user_intent,
+    generate_full_daily_briefing,
+    ai_reply,
+    analyze_document_context,
+    get_contextual_ai_response,
+    # is_document_followup_question, # Removed this unstable dependency
+    draft_email_interactive,
+    transcribe_audio
+)
+# Imported new email sender
+from email_sender import send_email
+from services import get_daily_quote, get_on_this_day_in_history, get_raw_weather_data, get_indian_festival_today
+from google_calendar_integration import get_google_auth_flow, create_google_calendar_event
+from google_drive import upload_file_to_drive, search_files_in_drive, analyze_drive_file_content
+from google_sheets import append_expense_to_sheet, get_sheet_link
+from youtube_search import search_youtube_for_video
+from meeting_scheduler import find_common_free_time, create_meeting_event
+from reminders import schedule_reminder, get_all_reminders, delete_reminder
+from messaging import send_message, send_template_message, send_interactive_menu, send_conversion_menu, send_reminders_list, send_delete_confirmation, send_google_drive_menu, send_meeting_proposal
+from document_processor import get_text_from_file
+from weather import get_weather
+from train_tracking import get_pnr_status, format_train_response
+
+
+app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+app.secret_key = os.urandom(24)
+
+# === CONFIGURATION ===
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "ranga123")
+ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
+PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
+GROK_API_KEY = os.environ.get("GROK_API_KEY")
+OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY")
+ADMIN_SECRET_KEY = os.environ.get("ADMIN_SECRET_KEY")
+MONGO_URI = os.environ.get("MONGO_URI")
+DEV_PHONE_NUMBER = os.environ.get("DEV_PHONE_NUMBER")
+GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI")
+
+
+# --- DATABASE & SCHEDULER ---
+client = MongoClient(MONGO_URI)
+db = client.ai_buddy_db
+users_collection = db.users
+jobs_collection = db.scheduled_jobs
+
+jobstores = {
+    'default': MongoDBJobStore(client=client, database="ai_buddy_db", collection="scheduled_jobs")
+}
+# HARDCODED TIMEZONE PRESERVED AS REQUESTED
+scheduler = BackgroundScheduler(jobstores=jobstores, timezone=pytz.timezone('Asia/Kolkata'))
+scheduler.start()
+
+
+if not os.path.exists("uploads"):
+    os.makedirs("uploads")
+
+# === HELPER FUNCTIONS ===
+def get_user_from_db(sender_number):
+    return users_collection.find_one({"_id": sender_number})
+
+def create_or_update_user_in_db(sender_number, data):
+    users_collection.update_one({"_id": sender_number}, {"$set": data}, upsert=True)
+
+def set_user_session(sender_number, session_data):
+    if session_data is None:
+        users_collection.update_one({"_id": sender_number}, {"$unset": {"session": ""}})
+    else:
+        users_collection.update_one({"_id": sender_number}, {"$set": {"session": session_data}}, upsert=True)
+
+def get_user_session(sender_number):
+    user_data = get_user_from_db(sender_number)
+    return user_data.get("session") if user_data else None
+
+def get_all_users_from_db():
+    return users_collection.find({}, {"_id": 1, "name": 1, "is_google_connected": 1, "location": 1})
+
+def delete_all_users_from_db():
+    return users_collection.delete_many({})
+
+def delete_user_by_id(user_id):
+    """Deletes a single user and their reminders by their phone number ID."""
+    delete_result = users_collection.delete_one({"_id": user_id})
+    
+    jobs_deleted_count = 0
+    for job in scheduler.get_jobs():
+        if job.id.startswith(f"reminder_{user_id}"):
+            scheduler.remove_job(job.id)
+            jobs_deleted_count += 1
+            
+    return delete_result.deleted_count > 0, jobs_deleted_count
+
+def delete_all_scheduled_jobs_from_db():
+    """Deletes all scheduled jobs from the database."""
+    return jobs_collection.delete_many({})
+
+def count_users_in_db():
+    return users_collection.count_documents({})
+
+def save_credentials_to_db(sender_number, credentials):
+    pickled_creds = pickle.dumps(credentials)
+    create_or_update_user_in_db(sender_number, {"google_credentials": pickled_creds, "is_google_connected": True})
+
+def get_credentials_from_db(sender_number):
+    user_data = get_user_from_db(sender_number)
+    if not user_data or "google_credentials" not in user_data:
+        return None
+    creds = pickle.loads(user_data["google_credentials"])
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        save_credentials_to_db(sender_number, creds)
+    if creds and creds.valid:
+        return creds
+    return None
+
+def get_user_email_from_google(credentials):
+    """Fetches the user's primary email address from their Google profile."""
+    try:
+        service = build('oauth2', 'v2', credentials=credentials)
+        user_info = service.userinfo().get().execute()
+        return user_info.get('email')
+    except Exception as e:
+        print(f"Error fetching user email from Google: {e}")
+        return None
+
+def send_google_auth_link(sender_number):
+    """Generates and sends the Google authentication link to a user."""
+    if GOOGLE_REDIRECT_URI:
+        try:
+            base_url = request.url_root
+            auth_link = f"{base_url}google-auth?state={sender_number}"
+            auth_message = (
+                "To connect or re-connect your Google Account for features like calendar events and email, "
+                f"please click this link:\n\n{auth_link}"
+            )
+            send_message(sender_number, auth_message)
+        except Exception as e:
+            print(f"Error generating Google Auth link: {e}")
+            send_message(sender_number, "Sorry, I couldn't generate a connection link right now.")
+    else:
+        send_message(sender_number, "Google connection is not configured on the server.")
+
+# --- NEW: Email Task Wrapper to prevent attachment corruption ---
+def send_email_task(credentials, recipient_emails, subject, body, attachment_paths=None):
+    """
+    Wraps send_email to handle file cleanup after sending.
+    This ensures scheduled emails have access to the file, and it is deleted afterwards.
+    """
+    try:
+        # 1. Send the email
+        result = send_email(credentials, recipient_emails, subject, body, attachment_paths)
+        
+        # 2. Cleanup attachments after sending
+        if attachment_paths:
+            for path in attachment_paths:
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                        print(f"🧹 Cleaned up attachment: {path}")
+                except Exception as e:
+                    print(f"⚠️ Error deleting attachment {path}: {e}")
+        return result
+    except Exception as e:
+        print(f"❌ Error in send_email_task: {e}")
+        return "❌ An error occurred while trying to send the email."
+
+# === ROUTES ===
+@app.route('/')
+def home():
+    return "WhatsApp AI Assistant is Live!"
+
+@app.route('/google-auth')
+def google_auth():
+    sender_number = request.args.get('state')
+    session['sender_number'] = sender_number
+    # Assuming google_calendar_integration is updated securely, calling it here
+    try:
+        flow = get_google_auth_flow()
+        authorization_url, _ = flow.authorization_url(access_type='offline', include_granted_scopes='true', state=sender_number)
+        return redirect(authorization_url)
+    except Exception as e:
+        return f"Auth Configuration Error: {e}", 500
+
+@app.route('/google-auth/callback')
+def google_auth_callback():
+    state = request.args.get('state')
+    sender_number = state
+    try:
+        flow = get_google_auth_flow()
+        flow.fetch_token(authorization_response=request.url)
+        credentials = flow.credentials
+        save_credentials_to_db(sender_number, credentials)
+        
+        email = get_user_email_from_google(credentials)
+        if email:
+            create_or_update_user_in_db(sender_number, {"email": email})
+
+        send_message(sender_number, "✅ Your Google account has been successfully connected!")
+        set_user_session(sender_number, None)
+        return "Authentication successful! You can return to WhatsApp."
+    except Exception as e:
+        print(f"Auth Callback Error: {e}")
+        return "Authentication failed.", 500
+
+@app.route('/test-briefing')
+def trigger_daily_briefing():
+    secret = request.args.get('secret')
+    if not ADMIN_SECRET_KEY or secret != ADMIN_SECRET_KEY:
+        return "Unauthorized: Invalid or missing secret key.", 401
+    send_daily_briefing()
+    return "✅ Daily briefing has been sent to all users.", 200
+
+@app.route('/notify-update')
+def trigger_update_notification():
+    secret = request.args.get('secret')
+    features = request.args.get('features')
+    if not ADMIN_SECRET_KEY or secret != ADMIN_SECRET_KEY:
+        return "Unauthorized: Invalid or missing secret key.", 401
+    if not features:
+        return "Bad Request: Please provide a 'features' parameter.", 400
+    scheduler.add_job(func=send_update_notification_to_all_users, trigger='date', run_date=datetime.now(pytz.timezone('Asia/Kolkata')) + timedelta(seconds=2), args=[features])
+    return f"✅ Success! Update notification scheduled for: '{features}'", 200
+
+@app.route('/webhook', methods=['GET'])
+def verify():
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+    if mode == "subscribe" and token == VERIFY_TOKEN: return challenge, 200
+    return "Verification failed", 403
+
+def download_media_from_whatsapp(media_id, message_payload):
+    try:
+        url = f"https://graph.facebook.com/v19.0/{media_id}/"
+        headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        media_info = response.json()
+        media_url = media_info['url']
+        
+        message_type = message_payload.get("type")
+        original_filename = f"media_{media_id}"
+
+        if message_type == 'document':
+            original_filename = message_payload.get('document', {}).get('filename', original_filename)
+        elif message_type == 'image':
+            ext = mimetypes.guess_extension(media_info.get('mime_type', '')) or '.jpg'
+            original_filename = f"whatsapp_image_{media_id}{ext}"
+        elif message_type == 'audio':
+            # WhatsApp voice notes usually come as audio/ogg
+            ext = mimetypes.guess_extension(media_info.get('mime_type', '')) or '.ogg'
+            original_filename = f"whatsapp_audio_{media_id}{ext}"
+
+        download_response = requests.get(media_url, headers=headers)
+        download_response.raise_for_status()
+        
+        temp_filename = secure_filename(original_filename)
+        if not temp_filename:
+            temp_filename = secure_filename(media_id) 
+            
+        file_path = os.path.join("uploads", temp_filename)
+        with open(file_path, "wb") as f: f.write(download_response.content)
+        
+        return file_path, original_filename, media_info.get('mime_type')
+        
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error downloading media: {e}")
+        return None, None, None
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.get_json()
+    # print("\n🚀 Received message:", json.dumps(data, indent=2))
+    try:
+        entry = data.get("entry", [])[0].get("changes", [])[0].get("value", {})
+        if "messages" not in entry or not entry["messages"]: return "OK", 200
+        message = entry["messages"][0]
+        sender_number = message["from"]
+        session_data = get_user_session(sender_number)
+        msg_type = message.get("type")
+
+        if msg_type == "interactive":
+            interactive_data = message["interactive"]
+            selection_id = ""
+            if interactive_data["type"] == "list_reply":
+                selection_id = interactive_data["list_reply"]["id"]
+            elif interactive_data["type"] == "button_reply":
+                selection_id = interactive_data["button_reply"]["id"]
+            
+            if selection_id:
+                handle_text_message(selection_id, sender_number, session_data)
+        elif msg_type == "text":
+            user_text = message["text"]["body"].strip()
+            handle_text_message(user_text, sender_number, session_data)
+        elif msg_type in ["document", "image"]:
+            handle_document_message(message, sender_number, session_data, msg_type)
+        elif msg_type == "audio":
+            handle_audio_message(message, sender_number, session_data)
+        else:
+            send_message(sender_number, "🤔 Sorry, I can only process text, audio, documents, and images at the moment.")
+
+    except Exception as e:
+        print(f"❌ Unhandled Error: {e}")
+    return "OK", 200
+
+# === MESSAGE HANDLERS ===
+
+def handle_audio_message(message, sender_number, session_data):
+    """
+    Downloads audio, transcribes it, and passes text to the normal handler.
+    """
+    media_id = message.get("audio", {}).get('id')
+    if not media_id:
+        send_message(sender_number, "❌ I couldn't process that audio.")
+        return
+
+    # Inform user we are listening
+    send_message(sender_number, "🎙️ Listening...")
+
+    downloaded_path = None
+    try:
+        downloaded_path, _, _ = download_media_from_whatsapp(media_id, message)
+        
+        if downloaded_path:
+            # Transcribe using Groq Whisper
+            transcribed_text = transcribe_audio(downloaded_path)
+            
+            if transcribed_text:
+                send_message(sender_number, f"🗣️ *You said:* \"{transcribed_text}\"")
+                # Pass the text to the standard text handler to trigger intent/actions
+                handle_text_message(transcribed_text, sender_number, session_data)
+            else:
+                send_message(sender_number, "❌ Sorry, I couldn't understand the audio.")
+        else:
+            send_message(sender_number, "❌ Failed to download audio note.")
+            
+    except Exception as e:
+        print(f"Audio handling error: {e}")
+        send_message(sender_number, "❌ An error occurred while processing your voice note.")
+    finally:
+        if downloaded_path and os.path.exists(downloaded_path):
+            os.remove(downloaded_path)
+
+def handle_document_message(message, sender_number, session_data, message_type):
+    media_id = message.get(message_type, {}).get('id')
+    if not media_id:
+        send_message(sender_number, "❌ I couldn't find the file in your message.")
+        return
+
+    # --- EMAIL ATTACHMENT HANDLING (UPDATED) ---
+    if isinstance(session_data, dict) and session_data.get("state") == "email_drafting":
+        send_message(sender_number, "📎 Downloading attachment for your email...")
+        downloaded_path, original_filename, mime_type = download_media_from_whatsapp(media_id, message)
+        
+        if downloaded_path:
+            # 1. Add to session attachments
+            attachments = session_data.get("attachments", [])
+            attachments.append(downloaded_path)
+            session_data["attachments"] = attachments
+            
+            # 2. UPDATE HISTORY so AI knows about the file (NEW FEATURE)
+            history = session_data.get("history", [])
+            history.append({"role": "system", "content": f"User uploaded an attachment: {original_filename}"})
+            session_data["history"] = history
+            
+            set_user_session(sender_number, session_data)
+            
+            send_message(sender_number, f"✅ Attached **'{original_filename}'**.\n\nYou can attach more files or continue writing your email (e.g., 'Send it now').")
+        else:
+            send_message(sender_number, "❌ Failed to download attachment.")
+        return # Returns here to skip the 'finally' block that deletes the file
+    # ---------------------------------
+
+    downloaded_path = None
+    try:
+        simple_state = None
+        if isinstance(session_data, dict):
+            simple_state = session_data.get("state")
+        elif isinstance(session_data, str):
+            simple_state = session_data
+
+        if simple_state == "awaiting_drive_upload_nlp":
+            send_message(sender_number, "📥 Got it. Uploading to your Google Drive...")
+            creds = get_credentials_from_db(sender_number)
+            if not creds:
+                send_message(sender_number, "❌ Cannot upload. Your Google account is not connected.")
+                set_user_session(sender_number, None)
+                return
+
+            downloaded_path, original_filename, mime_type = download_media_from_whatsapp(media_id, message)
+            if downloaded_path:
+                upload_status = upload_file_to_drive(creds, downloaded_path, original_filename, mime_type)
+                send_message(sender_number, upload_status)
+            else:
+                send_message(sender_number, "❌ Sorry, I couldn't download your file to upload it.")
+            
+            set_user_session(sender_number, None)
+            return
+
+        if simple_state == "awaiting_drive_upload":
+            send_message(sender_number, "📥 Got your file. Uploading it to your Google Drive...")
+            creds = get_credentials_from_db(sender_number)
+            if not creds:
+                send_message(sender_number, "❌ Cannot upload. Your Google account is not connected. Please go to the menu to connect it.")
+                set_user_session(sender_number, None)
+                return
+
+            downloaded_path, original_filename, mime_type = download_media_from_whatsapp(media_id, message)
+            if downloaded_path:
+                upload_status = upload_file_to_drive(creds, downloaded_path, original_filename, mime_type)
+                send_message(sender_number, upload_status)
+            else:
+                send_message(sender_number, "❌ Sorry, I couldn't download your file to upload it. Please try again.")
+            
+            set_user_session(sender_number, None)
+            return
+
+        if simple_state in ["awaiting_pdf_to_text", "awaiting_pdf_to_docx"]:
+            downloaded_path, _, mime_type = download_media_from_whatsapp(media_id, message)
+            if not downloaded_path:
+                send_message(sender_number, "❌ Sorry, I couldn't download your file. Please try again.")
+                return
+            
+            if simple_state == "awaiting_pdf_to_text":
+                extracted_text = get_text_from_file(downloaded_path, mime_type)
+                response = extracted_text if extracted_text else "Could not find any readable text in the PDF."
+                send_message(sender_number, response)
+            elif simple_state == "awaiting_pdf_to_docx":
+                output_docx_path = downloaded_path + ".docx"
+                cv = Converter(downloaded_path)
+                cv.convert(output_docx_path, start=0, end=None)
+                cv.close()
+                send_file_to_user(sender_number, output_docx_path, "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "📄 Here is your converted Word file.")
+                if os.path.exists(output_docx_path): os.remove(output_docx_path)
+            set_user_session(sender_number, None)
+            return
+
+        send_message(sender_number, "📄 Got your file! Analyzing it with AI...")
+        downloaded_path, _, mime_type = download_media_from_whatsapp(media_id, message)
+        if not downloaded_path:
+            send_message(sender_number, "❌ Sorry, I couldn't download your file. Please try again.")
+            return
+            
+        extracted_text = get_text_from_file(downloaded_path, mime_type)
+        if not extracted_text:
+            send_message(sender_number, "❌ I couldn't find any readable text in that file.")
+            return
+
+        analysis = analyze_document_context(extracted_text)
+        if not analysis:
+            send_message(sender_number, "🤔 I analyzed the document, but I'm not sure what to do with it.")
+            set_user_session(sender_number, None)
+            return
+            
+        doc_type = analysis.get("doc_type")
+        data = analysis.get("data", {})
+
+        new_session = {"state": "awaiting_document_question", "document_text": extracted_text, "doc_type": doc_type, "data": data}
+        set_user_session(sender_number, new_session)
+
+        if doc_type == "resume":
+            response = "I've analyzed your resume. I can give you a score and feedback, or you can ask me specific questions about it (e.g., 'critique my resume' or 'what are my key skills?')."
+        elif doc_type == "project_plan":
+            response = "I've read your project plan. You can now ask me questions about it (e.g., 'what is the main goal?' or 'summarize the tech stack')."
+        elif doc_type == "meeting_invite":
+            task = data.get("task", "this event")
+            response = f"I see this is an invitation for '{task}'. Would you like me to schedule it for you?"
+        elif doc_type == "q_and_a":
+            response = "I've processed the questions in your document. You can ask me to 'answer all questions', or ask about a specific one."
+        else:
+            response = "I've finished reading your document. You can ask me to summarize it, or ask any specific questions you have about the content."
+        send_message(sender_number, response)
+    finally:
+        if downloaded_path and os.path.exists(downloaded_path):
+            os.remove(downloaded_path)
+
+def process_meeting_scheduling(sender_number, session_data):
+    creds_list = [get_credentials_from_db(sender_number)]
+    attendees_emails = session_data["attendees_emails"]
+    for email in attendees_emails:
+        user_data = users_collection.find_one({"email": email})
+        if user_data:
+            attendee_creds = get_credentials_from_db(user_data["_id"])
+            if attendee_creds:
+                creds_list.append(attendee_creds)
+    
+    # Define a time window to search for a free slot
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    start_search = now + timedelta(days=1)
+    end_search = now + timedelta(days=7)
+
+    # Calling find_common_free_time with original signature (no extra timezone arg)
+    proposed_time = find_common_free_time(creds_list, session_data['duration_minutes'], start_search, end_search)
+    
+    if proposed_time:
+        send_meeting_proposal(sender_number, proposed_time, session_data['session_id'])
+        session_data["start_time"] = proposed_time.isoformat()
+        session_data["state"] = "awaiting_meeting_confirmation"
+        set_user_session(sender_number, session_data)
+    else:
+        send_message(sender_number, "❌ Sorry, I couldn't find a common free time for all attendees in the next 7 days. Please try again with a different timeframe or fewer attendees.")
+        set_user_session(sender_number, None)
+
+def handle_text_message(user_text, sender_number, session_data):
+    user_text_lower = user_text.lower()
+    menu_commands = ["start", "menu", "help", "options", "0"]
+    greetings = ["hi", "hello", "hey"]
+    
+    if user_text.startswith("delete_reminder_"):
+        job_id_to_delete = user_text.split("delete_reminder_")[1]
+        # Calling get_all_reminders with original signature
+        reminders = get_all_reminders(sender_number, scheduler)
+        task_to_delete = next((rem['task'] for rem in reminders if rem['id'] == job_id_to_delete), "this reminder")
+        send_delete_confirmation(sender_number, job_id_to_delete, task_to_delete)
+        return
+
+    if user_text.startswith("confirm_delete_"):
+        job_id_to_delete = user_text.split("confirm_delete_")[1]
+        if delete_reminder(job_id_to_delete, scheduler):
+            send_message(sender_number, "✅ Reminder successfully deleted.")
+        else:
+            send_message(sender_number, "❌ Could not delete the reminder. It might have already been removed.")
+        return
+    
+    if user_text == "cancel_delete":
+        send_message(sender_number, "Deletion cancelled.")
+        return
+
+    # --- EMAIL ASSISTANT STATE LOOP (UPDATED) ---
+    if isinstance(session_data, dict) and session_data.get("state") == "email_drafting":
+        
+        if user_text_lower in ["exit", "cancel", "stop", "menu"]:
+            # Cleanup any uploaded files if user cancels
+            attachments = session_data.get("attachments", [])
+            for f in attachments:
+                if os.path.exists(f): os.remove(f)
+            set_user_session(sender_number, None)
+            if user_text_lower == "menu":
+                send_interactive_menu(sender_number, get_user_from_db(sender_number).get("name", "User"))
+            else:
+                send_message(sender_number, "❌ Email drafting cancelled.")
+            return
+
+        # 1. Update History
+        history = session_data.get("history", [])
+        history.append({"role": "user", "content": user_text})
+        
+        # 2. Get User Name (Fix for "Best regards, User")
+        user_data = get_user_from_db(sender_number)
+        user_name = user_data.get("name", "User") if user_data else "User"
+
+        # 3. Call Grok (Interactive Mode) passing user_name
+        ai_response = draft_email_interactive(history, user_name=user_name)
+        
+        # 4. Check if AI wants to SEND (JSON received)
+        if isinstance(ai_response, dict) and ai_response.get("action") == "SEND_EMAIL":
+            
+            # Extract details
+            subject = ai_response.get("subject")
+            body = ai_response.get("body")
+            scheduled_time_str = ai_response.get("scheduled_time")
+            recipient = ai_response.get("recipient_email")
+            attachments = session_data.get("attachments", [])
+
+            # Fallback if AI couldn't extract recipient (ask user)
+            if not recipient or recipient == "extracted_email_address_or_null":
+                session_data["history"].append({"role": "assistant", "content": "I am ready to send, but I need the recipient's email address."})
+                set_user_session(sender_number, session_data)
+                send_message(sender_number, "⚠️ I have the email ready, but I need the **recipient's email address**. Please type it now.")
+                return
+
+            creds = get_credentials_from_db(sender_number)
+            if not creds:
+                send_message(sender_number, "❌ Cannot send: Google Account not connected. Type .reconnect")
+                set_user_session(sender_number, None)
+                return
+
+            # Handle Scheduling & Sending
+            if scheduled_time_str and scheduled_time_str != "NOW":
+                try:
+                    run_date = date_parser.parse(scheduled_time_str)
+                    
+                    # USE send_email_task wrapper here
+                    scheduler.add_job(
+                        func=send_email_task,
+                        trigger='date',
+                        run_date=run_date,
+                        args=[creds, recipient, subject, body, attachments]
+                    )
+                    send_message(sender_number, f"✅ Email scheduled for *{run_date.strftime('%A, %b %d at %I:%M %p')}*!")
+                    
+                    # Do NOT delete attachments here; the job will do it.
+                except Exception as e:
+                     send_message(sender_number, f"❌ Error understanding time '{scheduled_time_str}'. Sending NOW instead.")
+                     send_email_task(creds, recipient, subject, body, attachments)
+            else:
+                # Send Immediately using wrapper
+                send_message(sender_number, "📨 Sending email now...")
+                status = send_email_task(creds, recipient, subject, body, attachments)
+                send_message(sender_number, status)
+
+            # Cleanup
+            set_user_session(sender_number, None)
+            return
+
+        # 5. Normal Conversation (AI asks questions or shows draft)
+        else:
+            # Send AI response to user
+            send_message(sender_number, str(ai_response))
+            
+            # Update history and save session
+            history.append({"role": "assistant", "content": str(ai_response)})
+            session_data["history"] = history
+            set_user_session(sender_number, session_data)
+            return
+
+    if user_text.startswith("confirm_meeting_"):
+        session_id = user_text.split("confirm_meeting_")[1]
+        if session_data and session_data.get("session_id") == session_id:
+            send_message(sender_number, "✅ Great! Scheduling the meeting and sending invitations now...")
+            
+            organizer_creds = get_credentials_from_db(sender_number)
+            attendees_emails = session_data["attendees_emails"]
+            start_time = date_parser.parse(session_data["start_time"])
+            end_time = start_time + timedelta(minutes=session_data["duration_minutes"])
+            topic = session_data["topic"]
+            
+            # Calling create_meeting_event with original signature
+            confirmation_message = create_meeting_event(organizer_creds, attendees_emails, start_time, end_time, topic)
+            send_message(sender_number, confirmation_message)
+            set_user_session(sender_number, None)
+        else:
+            send_message(sender_number, "😕 This meeting proposal has expired. Please try scheduling again.")
+        return
+
+    if user_text == "cancel_meeting":
+        send_message(sender_number, "👍 Okay, I've cancelled the meeting request.")
+        set_user_session(sender_number, None)
+        return
+
+    if user_text.startswith("."):
+        if user_text.startswith(".dev"):
+            if not DEV_PHONE_NUMBER or sender_number != DEV_PHONE_NUMBER:
+                send_message(sender_number, "❌ Unauthorized: This is a developer-only command.")
+                return
+            parts = user_text.split()
+            if len(parts) < 3:
+                send_message(sender_number, "❌ Invalid command format.\nUse: `.dev <secret_key> <feature_list>`")
+                return
+            command, key, features = parts[0], parts[1], " ".join(parts[2:])
+            if not ADMIN_SECRET_KEY or key != ADMIN_SECRET_KEY:
+                send_message(sender_number, "❌ Invalid admin secret key.")
+                return
+            scheduler.add_job(func=send_update_notification_to_all_users, trigger='date', run_date=datetime.now(pytz.timezone('Asia/Kolkata')) + timedelta(seconds=2), args=[features])
+            send_message(sender_number, f"✅ Success! Update notification job scheduled for all users.\n\n*Features:* {features}")
+            return
+
+        elif user_text.startswith(".test"):
+            if not DEV_PHONE_NUMBER or sender_number != DEV_PHONE_NUMBER:
+                send_message(sender_number, "❌ Unauthorized: This is a developer-only command.")
+                return
+            parts = user_text.split()
+            if len(parts) != 2:
+                send_message(sender_number, "❌ Invalid format. Use: `.test <passcode>`")
+                return
+            passcode = parts[1]
+            if not ADMIN_SECRET_KEY or passcode != ADMIN_SECRET_KEY:
+                send_message(sender_number, "❌ Invalid passcode.")
+                return
+            send_message(sender_number, "✅ Roger that. Sending a test briefing to you now...")
+            send_test_briefing(sender_number)
+            return
+            
+        elif user_text.startswith(".nuke"):
+            if not DEV_PHONE_NUMBER or sender_number != DEV_PHONE_NUMBER:
+                send_message(sender_number, "❌ Unauthorized: This is a developer-only command.")
+                return
+            
+            parts = user_text.split()
+            if len(parts) != 2:
+                send_message(sender_number, "❌ Invalid format. Use `.nuke all` or `.nuke <phone_number>`.")
+                return
+
+            target = parts[1]
+            if target == "all":
+                user_result = delete_all_users_from_db()
+                scheduler.remove_all_jobs()
+                user_count = user_result.deleted_count
+                send_message(sender_number, "💥 NUKE COMPLETE 💥\n\nSuccessfully deleted {user_count} user(s) and all scheduled reminders. The bot has been reset.")
+            else:
+                user_deleted, jobs_deleted = delete_user_by_id(target)
+                if user_deleted:
+                    send_message(sender_number, f"✅ Successfully deleted user `{target}` and their {jobs_deleted} reminder(s).")
+                else:
+                    send_message(sender_number, f"😕 Could not find a user with the phone number `{target}`.")
+            return
+
+        elif user_text.lower() == ".stats":
+            if not DEV_PHONE_NUMBER or sender_number != DEV_PHONE_NUMBER:
+                send_message(sender_number, "❌ Unauthorized: This is a developer-only command.")
+                return
+            
+            all_users = list(get_all_users_from_db())
+            count = len(all_users)
+            
+            stats_message = f"📊 *Bot Statistics*\n\nTotal Registered Users: *{count}*\n\n"
+            if all_users:
+                user_list = []
+                for i, user in enumerate(all_users):
+                    user_name = user.get("name", "N/A")
+                    user_id = user.get("_id", "N/A")
+                    user_list.append(f"{i+1}. *{user_name}* (`{user_id}`)")
+                stats_message += "\n".join(user_list)
+            else:
+                stats_message += "_No users found._"
+                
+            send_message(sender_number, stats_message)
+            return
+        
+        elif user_text.lower() == ".reconnect":
+            send_google_auth_link(sender_number)
+            return
+        
+        elif user_text.lower() == ".reminders":
+            reminders = get_all_reminders(sender_number, scheduler)
+            send_reminders_list(sender_number, reminders)
+            return
+
+    current_state = None
+    if isinstance(session_data, dict):
+        current_state = session_data.get("state")
+    elif isinstance(session_data, str):
+        current_state = session_data
+
+    if current_state:
+        if current_state == "awaiting_attendee_emails":
+            provided_email = user_text.strip()
+            if "@" in provided_email and "." in provided_email:
+                attendee_name = session_data["pending_attendee"]
+                session_data["attendees_emails"].append(provided_email)
+                
+                session_data["pending_attendees"].pop(0)
+                if session_data["pending_attendees"]:
+                    next_attendee = session_data["pending_attendees"][0]
+                    session_data["pending_attendee"] = next_attendee
+                    set_user_session(sender_number, session_data)
+                    send_message(sender_number, f"✅ Got it for {attendee_name}. Now, what is the email address for *{next_attendee}*?")
+                else:
+                    send_message(sender_number, "✅ Got all emails! Now finding a time for everyone...")
+                    scheduler.add_job(
+                        func=process_meeting_scheduling,
+                        trigger='date',
+                        run_date=datetime.now(pytz.timezone('Asia/Kolkata')) + timedelta(seconds=1),
+                        args=[sender_number, session_data]
+                    )
+            else:
+                send_message(sender_number, "That doesn't look like a valid email address. Please try again.")
+            return
+
+        if current_state == "awaiting_drive_analysis_query":
+            send_message(sender_number, f"📄 Analyzing '*{user_text}*' from your Google Drive. This may take a moment...")
+            creds = get_credentials_from_db(sender_number)
+            if creds:
+                analysis_result = analyze_drive_file_content(creds, user_text)
+                error = analysis_result.get("error")
+                if error:
+                    send_message(sender_number, error)
+                    set_user_session(sender_number, None)
+                else:
+                    new_session = {
+                        "state": "awaiting_document_question",
+                        "document_text": analysis_result.get("document_text"),
+                        "doc_type": analysis_result.get("doc_type"),
+                        "data": analysis_result.get("data", {})
+                    }
+                    set_user_session(sender_number, new_session)
+
+                    doc_type = new_session["doc_type"]
+                    if doc_type == "resume":
+                        response = "I've analyzed the resume from your Drive. You can ask me specific questions about it (e.g., 'what are the key skills?')."
+                    elif doc_type == "project_plan":
+                        response = "I've read the project plan from your Drive. You can now ask me questions about it."
+                    elif doc_type == "meeting_invite":
+                        task = new_session["data"].get("task", "this event")
+                        response = f"I see this is an invitation for '{task}' from your Drive. Would you like me to schedule it?"
+                    else:
+                        response = "I've finished reading your document from Drive. You can ask me to summarize it, or ask any specific questions you have."
+                    send_message(sender_number, response)
+
+            else:
+                send_message(sender_number, "❌ Could not analyze. Your Google account is not connected.")
+                set_user_session(sender_number, None)
+            return
+
+        if current_state == "awaiting_drive_search_query":
+            send_message(sender_number, f"🔎 Searching for '*{user_text}*' in your Google Drive...")
+            creds = get_credentials_from_db(sender_number)
+            if creds:
+                search_results = search_files_in_drive(creds, user_text)
+                send_message(sender_number, search_results)
+            else:
+                send_message(sender_number, "❌ Could not search. Your Google account is not connected.")
+            set_user_session(sender_number, None)
+            return
+
+        if current_state == "awaiting_reminder_text":
+            send_message(sender_number, "Got it! I'm working on scheduling your reminders. This might take a moment...")
+            scheduler.add_job(
+                func=process_and_schedule_reminders,
+                trigger='date',
+                run_date=datetime.now(pytz.timezone('Asia/Kolkata')) + timedelta(seconds=2),
+                args=[user_text, sender_number]
+            )
+            set_user_session(sender_number, None)
+            return
+
+        # =========================================================
+        # FIX: REMOVE AI GATEKEEPER FROM DOCUMENT Q&A
+        # =========================================================
+        if current_state == "awaiting_document_question":
+            # 1. CHECK FOR EXIT COMMANDS MANUALLY
+            if user_text_lower in ["menu", "start", "stop", "exit", "cancel", "0"]:
+                set_user_session(sender_number, None)
+                if user_text_lower == "menu":
+                     send_interactive_menu(sender_number, get_user_from_db(sender_number).get("name", "User"))
+                else:
+                     send_message(sender_number, "Exited document analysis mode.")
+                return
+
+            # 2. ASSUME IT IS A FOLLOW-UP QUESTION (No AI Check)
+            doc_text = session_data.get("document_text")
+            if not doc_text:
+                send_message(sender_number, "❌ Error: Document content lost. Please upload again.")
+                set_user_session(sender_number, None)
+                return
+
+            send_message(sender_number, "🤖 Thinking...")
+            response = get_contextual_ai_response(doc_text, user_text)
+            send_message(sender_number, response)
+            send_message(sender_number, "_Ask another question about this document, or type `menu` to exit._")
+            return
+        # =========================================================
+
+        elif current_state == "awaiting_ai":
+            if user_text_lower in menu_commands or any(greet in user_text_lower for greet in greetings):
+                set_user_session(sender_number, None)
+                user_data = get_user_from_db(sender_number)
+                send_welcome_message(sender_number, user_data.get("name", "User"))
+            else:
+                response_text = ai_reply(user_text)
+                send_message(sender_number, response_text)
+            return
+        elif current_state == "awaiting_text_to_pdf":
+            pdf_path = convert_text_to_pdf(user_text)
+            send_file_to_user(sender_number, pdf_path, "application/pdf", "📄 Here is your converted PDF file.")
+            if os.path.exists(pdf_path): os.remove(pdf_path)
+            set_user_session(sender_number, None)
+            return
+        elif current_state == "awaiting_text_to_word":
+            docx_path = convert_text_to_word(user_text)
+            send_file_to_user(sender_number, docx_path, "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "📄 Here is your converted Word file.")
+            if os.path.exists(docx_path): os.remove(docx_path)
+            set_user_session(sender_number, None)
+            return
+        elif current_state == "awaiting_name":
+            name = user_text.split()[0].title()
+            create_or_update_user_in_db(sender_number, {"name": name, "expenses": [], "is_google_connected": False, "location": None})
+            set_user_session(sender_number, "awaiting_location")
+            send_message(sender_number, f"✅ Got it! I’ll remember you as *{name}*.")
+            time.sleep(1)
+            send_message(sender_number, "To provide you with accurate weather in your morning briefings, what city do you live in?")
+            return
+        
+        elif current_state == "awaiting_location":
+            create_or_update_user_in_db(sender_number, {"location": user_text.title()})
+            set_user_session(sender_number, None)
+            send_message(sender_number, f"✅ Great! I've set your location to *{user_text.title()}*.")
+            time.sleep(1)
+            send_google_auth_link(sender_number)
+            time.sleep(2)
+            send_welcome_message(sender_number, get_user_from_db(sender_number).get("name"))
+            return
+        
+        elif current_state == "awaiting_weather":
+            response_text = get_weather(user_text)
+            set_user_session(sender_number, None)
+            send_message(sender_number, response_text)
+            return
+
+    
+    if user_text_lower in menu_commands or any(greet in user_text_lower for greet in greetings):
+        set_user_session(sender_number, None)
+        user_data = get_user_from_db(sender_number)
+        if not user_data:
+            set_user_session(sender_number, "awaiting_name")
+            send_message(sender_number, "👋 Hi there! To personalize your experience, what should I call you?")
+        else:
+            send_welcome_message(sender_number, user_data.get("name"))
+        return
+
+    # UPDATED MENU OPTION NUMBERS
+    if user_text == "1": # Set Reminder
+        set_user_session(sender_number, "awaiting_reminder_text")
+        send_message(sender_number, "🕒 Sure, what's the reminder? (e.g., 'Call mom tomorrow at 5pm')")
+        return
+    elif user_text == "2": # Ask AI (was 3)
+        set_user_session(sender_number, "awaiting_ai")
+        send_message(sender_number, "🤖 I'm ready! Ask me anything, and I'll do my best to answer.")
+        return
+    elif user_text == "3": # File Conv (was 4)
+        send_conversion_menu(sender_number)
+        return
+    elif user_text == "4": # Weather (was 5)
+        set_user_session(sender_number, "awaiting_weather")
+        send_message(sender_number, "🏙️ Enter a city or location to get the current weather.")
+        return
+    elif user_text == "5": # Currency (was 6)
+        send_message(sender_number, "💱 What would you like to convert? (e.g., '100 USD to INR')")
+        return
+    elif user_text == "6": # Drive (was 8)
+        creds = get_credentials_from_db(sender_number)
+        if creds:
+            send_google_drive_menu(sender_number)
+        else:
+            send_message(sender_number, "⚠️ To use Google Drive features, you must first connect your Google account.")
+        return
+    # --- NEW OPTION 7: EMAIL ASSISTANT ---
+    elif user_text == "7" or "email" in user_text_lower: 
+        if not get_credentials_from_db(sender_number):
+             send_message(sender_number, "⚠️ To send emails, please connect your Google Account first via .reconnect")
+             return
+
+        # Initialize Email Session
+        initial_state = {
+            "state": "email_drafting",
+            "history": [],
+            "attachments": [] 
+        }
+        
+        # --- FIX: INJECT CAPABILITY KNOWLEDGE (Prevents "I can't attach files" error) ---
+        initial_state["history"].append({"role": "system", "content": "CAPABILITY UPDATE: You CAN receive file attachments. If the user says they want to attach a document, tell them to simply upload the file to this WhatsApp chat, and you will see it."})
+        # -------------------------------------------------------------------------------
+
+        set_user_session(sender_number, initial_state)
+        send_message(sender_number, "📧 **AI Email Assistant**\n\nTell me what you want to write. I'll help you draft, refine, and schedule it.\n\n*Example:* 'Write a sick leave email to my boss for tomorrow.'\n\n_(You can also send a file now to attach it)_")
+        return
+    # -------------------------------------
+    elif user_text == "reminders_check":
+        # Calling get_all_reminders with original signature
+        reminders = get_all_reminders(sender_number, scheduler)
+        send_reminders_list(sender_number, reminders)
+        return
+    elif user_text == "conv_pdf_to_text":
+        set_user_session(sender_number, "awaiting_pdf_to_text")
+        send_message(sender_number, "📄 Please send the PDF file you want to convert to text.")
+        return
+    elif user_text == "conv_text_to_pdf":
+        set_user_session(sender_number, "awaiting_text_to_pdf")
+        send_message(sender_number, "📝 Please send the text you want to convert into a PDF document.")
+        return
+    elif user_text == "conv_pdf_to_word":
+        set_user_session(sender_number, "awaiting_pdf_to_docx")
+        send_message(sender_number, "📄 Please send the PDF file you want to convert to a Word document.")
+        return
+    elif user_text == "conv_text_to_word":
+        set_user_session(sender_number, "awaiting_text_to_word")
+        send_message(sender_number, "📝 Please send the text you want to convert into a Word document.")
+        return
+    elif user_text == "drive_upload_file":
+        set_user_session(sender_number, "awaiting_drive_upload")
+        send_message(sender_number, "📎 Please send the file you want to upload to your Google Drive.")
+        return
+    elif user_text == "drive_search_file":
+        set_user_session(sender_number, "awaiting_drive_search_query")
+        send_message(sender_number, "📝 What are you searching for? Please provide a file name or keyword.")
+        return
+    elif user_text == "drive_analyze_file":
+        set_user_session(sender_number, "awaiting_drive_analysis_query")
+        send_message(sender_number, "📝 What is the exact name of the file you want to analyze?")
+        return
+
+    send_message(sender_number, "🤖 Analyzing your request...")
+    scheduler.add_job(
+        func=process_natural_language_request,
+        trigger='date',
+        run_date=datetime.now(pytz.timezone('Asia/Kolkata')) + timedelta(seconds=1),
+        args=[user_text, sender_number]
+    )
+
+
+def process_natural_language_request(user_text, sender_number):
+    intent_data = route_user_intent(user_text)
+    intent = intent_data.get("intent")
+    entities = intent_data.get("entities")
+    response_text = ""
+
+    creds = get_credentials_from_db(sender_number)
+    google_intents = ["drive_upload_file", "drive_search_file", "drive_analyze_file", "get_expense_sheet", "youtube_search", "schedule_meeting", "email_assistant"]
+    if intent in google_intents and not creds:
+        send_message(sender_number, "⚠️ To use this Google feature, you must first connect your Google account.")
+        return
+
+    if intent == "email_assistant":
+         # Trigger the same logic as option 7
+         initial_state = {
+            "state": "email_drafting",
+            "history": [],
+            "attachments": [] 
+         }
+         
+         # --- FIX: INJECT CAPABILITY KNOWLEDGE ---
+         initial_state["history"].append({"role": "system", "content": "CAPABILITY UPDATE: You CAN receive file attachments. If the user says they want to attach a document, tell them to simply upload the file to this WhatsApp chat, and you will see it."})
+         # ----------------------------------------
+
+         # Add the user's initial prompt to history so AI knows what to draft immediately
+         initial_state["history"].append({"role": "user", "content": user_text})
+         set_user_session(sender_number, initial_state)
+         
+         # 1. Get User Name (Fix for "Best regards, User")
+         user_data = get_user_from_db(sender_number)
+         user_name = user_data.get("name", "User") if user_data else "User"
+
+         # 2. Call AI passing user_name
+         ai_response = draft_email_interactive(initial_state["history"], user_name=user_name)
+         
+         if isinstance(ai_response, dict) and ai_response.get("action") == "SEND_EMAIL":
+             pass 
+
+         send_message(sender_number, str(ai_response))
+         # Update history with AI response
+         initial_state["history"].append({"role": "assistant", "content": str(ai_response)})
+         set_user_session(sender_number, initial_state)
+         return
+
+    if intent == "schedule_meeting":
+        user_data = get_user_from_db(sender_number)
+        organizer_email = user_data.get("email")
+        if not organizer_email:
+            send_message(sender_number, "⚠️ I couldn't find your email address. Please try reconnecting your Google account with `.reconnect`.")
+            return
+
+        attendees = entities.get("attendees", [])
+        topic = entities.get("topic", "Meeting")
+        duration = entities.get("duration_minutes", 30)
+        
+        session_id = str(int(time.time()))
+        new_session = {
+            "state": "scheduling_meeting",
+            "session_id": session_id,
+            "topic": topic,
+            "duration_minutes": duration,
+            "attendees_emails": [organizer_email],
+            "pending_attendees": []
+        }
+        
+        for name in attendees:
+            attendee_data = users_collection.find_one({"name": {"$regex": f"^{name}$", "$options": "i"}})
+            if attendee_data and attendee_data.get("email"):
+                new_session["attendees_emails"].append(attendee_data["email"])
+            else:
+                # Add to a separate list of attendees to prompt for emails
+                new_session["pending_attendees"].append(name)
+        
+        if new_session["pending_attendees"]:
+            new_session["state"] = "awaiting_attendee_emails"
+            first_pending = new_session["pending_attendees"][0]
+            new_session["pending_attendee"] = first_pending
+            set_user_session(sender_number, new_session)
+            send_message(sender_number, f"Okay, I can schedule a meeting about '{topic}'.\n\nI don't have the email address for *{first_pending}*. What is it?")
+        else:
+            send_message(sender_number, "✅ Got it! Finding a time for everyone...")
+            scheduler.add_job(
+                func=process_meeting_scheduling,
+                trigger='date',
+                run_date=datetime.now(pytz.timezone('Asia/Kolkata')) + timedelta(seconds=1),
+                args=[sender_number, new_session]
+            )
+            set_user_session(sender_number, None)
+        return
+        
+    elif intent == "drive_upload_file":
+        set_user_session(sender_number, "awaiting_drive_upload_nlp")
+        send_message(sender_number, "Got it. Please send the file you want to upload to your Drive.")
+        return
+        
+    elif intent == "drive_search_file":
+        query = entities.get("query")
+        if query:
+            send_message(sender_number, f"🔎 Searching for '*{query}*' in your Google Drive...")
+            response_text = search_files_in_drive(creds, query)
+        else:
+            response_text = "I didn't understand what file you want to search for. Please try again."
+
+    elif intent == "drive_analyze_file":
+        filename = entities.get("filename")
+        if filename:
+            send_message(sender_number, f"📄 Analyzing '*{filename}*' from your Drive. This might take a moment...")
+            analysis_result = analyze_drive_file_content(creds, filename)
+            error = analysis_result.get("error")
+            if error:
+                response_text = error
+            else:
+                new_session = {
+                    "state": "awaiting_document_question",
+                    "document_text": analysis_result.get("document_text"),
+                    "doc_type": analysis_result.get("doc_type"),
+                    "data": analysis_result.get("data", {})
+                }
+                set_user_session(sender_number, new_session)
+
+                doc_type = new_session["doc_type"]
+                if doc_type == "resume":
+                    response_text = "I've analyzed the resume from your Drive. You can ask me specific questions about it (e.g., 'what are the key skills?')."
+                else:
+                    response_text = "I've finished reading your document from Drive. You can ask me to summarize it."
+        else:
+            response_text = "I didn't understand which file you want to analyze. Please be more specific."
+
+    elif intent == "youtube_search":
+        query = entities.get("query")
+        if query:
+            send_message(sender_number, f"🔎 Searching YouTube for '*{query}*'...")
+            response_text = search_youtube_for_video(creds, query)
+        else:
+            response_text = "I didn't understand what you want to search for on YouTube."
+
+    elif intent == "get_bot_identity":
+        response_text = (
+            "I am AI Buddy, a smart WhatsApp assistant 🤖.\n\n"
+            "I was created by *Leela Ranga Prasad* , "
+            "a passionate B.Tech 2nd year student from SAHE University.\n\n"
+            "He designed me to make everyday digital tasks easier and more conversational. "
+            "You can ask me to set reminders, search for information, manage your files, and much more!"
+        )
+
+    elif intent == "get_features":
+        response_text = (
+            "Of course! Here is a full list of my capabilities:\n\n"
+            "🧠 *AI & Information*\n"
+            "• *Ask Me Anything*: Get answers to general questions.\n"
+            "• *YouTube Search*: Find any video from YouTube.\n"
+            "• *Weather Forecast*: Get the current weather for any city.\n"
+            "• *Currency Converter*: Convert between different currencies.\n\n"
+            "🗓️ *Productivity*\n"
+            "• *Set Reminders*: Set one-time or recurring reminders.\n"
+            "• *Expense Tracker*: Log your expenses to a live Google Sheet.\n\n"
+            "📁 *File & Document Management*\n"
+            "• *File Conversion*: Convert between PDF, Word, and Text.\n"
+            "• *Google Drive*: Upload, search, and analyze files in your Drive.\n\n"
+            "✨ *Hidden Commands*\n"
+            "• `.reminders`: See a list of all your active reminders.\n"
+            "• `.reconnect`: Refresh your Google account connection.\n\n"
+            "Type `menu` at any time to see the main options!"
+        )
+
+    elif intent == "set_reminder":
+        reminders_to_set = entities
+        if isinstance(reminders_to_set, list) and reminders_to_set:
+            if len(reminders_to_set) > 1:
+                send_message(sender_number, f"Got it! Scheduling {len(reminders_to_set)} reminders...")
+            for rem in reminders_to_set:
+                 task, timestamp, recurrence = rem.get("task"), rem.get("timestamp"), rem.get("recurrence")
+                 # Calling schedule_reminder with original signature (no extra timezone arg)
+                 conf = schedule_reminder(task, timestamp, recurrence, sender_number, get_credentials_from_db, scheduler)
+                 send_message(sender_number, conf)
+                 time.sleep(1)
+            return
+        else:
+            response_text = "Sorry, I couldn't find any reminders to set in your message."
+
+    elif intent == "log_expense":
+        if entities:
+            confirmations = [log_expense(sender_number, e.get('cost'), e.get('item'), e.get('place'), e.get('timestamp')) for e in entities if isinstance(e.get('cost'), (int, float))]
+            response_text = "\n".join(confirmations)
+        else:
+            response_text = "Sorry, I couldn't understand that as an expense."
+
+    elif intent == "export_expenses":
+        send_message(sender_number, "📊 Generating your expense report...")
+        user_data = get_user_from_db(sender_number)
+        file_path = export_expenses_to_excel(sender_number, user_data)
+        if file_path:
+            send_file_to_user(sender_number, file_path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "Here is your expense report.")
+            os.remove(file_path)
+        else:
+            send_message(sender_number, "You have no expenses to export yet.")
+        return 
+
+    elif intent == "get_expense_sheet":
+        response_text = get_sheet_link(creds, sender_number)
+
+    elif intent == "get_reminders":
+        reminders = get_all_reminders(sender_number, scheduler)
+        send_reminders_list(sender_number, reminders)
+        return
+
+    elif intent == "convert_currency":
+        if entities:
+            results = [convert_currency(c.get('amount'), c.get('from_currency'), c.get('to_currency')) for c in entities]
+            response_text = "\n\n".join(results)
+        else:
+            response_text = "Sorry, I couldn't understand that currency conversion."
+    
+    elif intent == "get_weather":
+        location = entities.get("location", "Vijayawada")
+        response_text = get_weather(location)
+        
+    elif intent == "general_query":
+        response_text = ai_reply(user_text)
+
+    elif intent == "train_tracking":
+        # 1. Extract PNR from entity OR regex (fallback)
+        pnr = entities.get("pnr")
+        if not pnr:
+            # Fallback: Search for any 10-digit number in user text
+            import re
+            match = re.search(r'\b\d{10}\b', user_text)
+            if match:
+                pnr = match.group(0)
+
+        if pnr:
+            send_message(sender_number, f"🔍 Checking live status for PNR *{pnr}*...")
+            
+            # 2. Call our new Tracking Module
+            status_data = get_pnr_status(pnr)
+            
+            # 3. Send the result
+            response_text = format_train_response(status_data)
+            send_message(sender_number, response_text)
+            return
+        else:
+            send_message(sender_number, "❌ I see you want to track a train, but I couldn't find a valid 10-digit PNR number. Please type it correctly.")
+            return
+
+    else:
+        response_text = "🤔 I'm not sure how to handle that. Please try rephrasing, or type *menu*."
+
+    if response_text:
+        send_message(sender_number, response_text)
+
+def process_and_schedule_reminders(user_text, sender_number):
+    intent_data = route_user_intent(user_text)
+    if intent_data.get("intent") == "set_reminder":
+        reminders_to_set = intent_data.get("entities", [])
+        
+        if isinstance(reminders_to_set, list) and reminders_to_set:
+            if len(reminders_to_set) > 1:
+                send_message(sender_number, f"Okay, scheduling {len(reminders_to_set)} reminders. I'll send a confirmation for each.")
+            for rem in reminders_to_set:
+                task, timestamp, recurrence = rem.get("task"), rem.get("timestamp"), rem.get("recurrence")
+                # Calling schedule_reminder with original signature
+                conf = schedule_reminder(task, timestamp, recurrence, sender_number, get_credentials_from_db, scheduler)
+                send_message(sender_number, conf)
+                time.sleep(1)
+        else:
+            send_message(sender_number, "I couldn't find any reminders to set in that message.")
+    else:
+        send_message(sender_number, "I didn't understand that as a reminder. Please try again.")
+
+def send_welcome_message(to, name):
+    send_interactive_menu(to, name)
+
+def send_file_to_user(to, file_path, mime_type, caption="Here is your file."):
+    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/media"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    with open(file_path, "rb") as f:
+        files = {'file': (os.path.basename(file_path), f, mime_type)}
+        data = {"messaging_product": "whatsapp"}
+        upload_response = requests.post(url, headers=headers, files=files, data=data)
+    if upload_response.status_code != 200:
+        print(f"Error uploading file: {upload_response.text}"); return
+    media_id = upload_response.json().get("id")
+    if not media_id: return
+    message_url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
+    payload = {"messaging_product": "whatsapp", "to": to, "type": "document", "document": {"id": media_id, "caption": caption}}
+    requests.post(message_url, headers={"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}, json=payload)
+
+def convert_text_to_pdf(text):
+    pdf = FPDF(); pdf.add_page(); pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.set_font("Arial", size=12)
+    pdf.multi_cell(0, 10, text.encode('latin-1', 'replace').decode('latin-1'))
+    filename = secure_filename(f"converted_{int(time.time())}.pdf")
+    file_path = os.path.join("uploads", filename)
+    pdf.output(file_path); return file_path
+
+def convert_text_to_word(text):
+    doc = Document(); doc.add_paragraph(text)
+    filename = secure_filename(f"converted_{int(time.time())}.docx")
+    file_path = os.path.join("uploads", filename)
+    doc.save(file_path); return file_path
+
+def log_expense(sender_number, amount, item, place=None, timestamp_str=None):
+    creds = get_credentials_from_db(sender_number)
+    
+    try:
+        expense_time = date_parser.parse(timestamp_str) if timestamp_str else datetime.now(pytz.timezone('Asia/Kolkata'))
+    except (date_parser.ParserError, TypeError):
+        expense_time = datetime.now(pytz.timezone('Asia/Kolkata'))
+
+    tz = pytz.timezone('Asia/Kolkata')
+    if expense_time.tzinfo is None:
+        expense_time = tz.localize(expense_time)
+
+    expense_data = {"cost": amount, "item": item, "place": place or "N/A", "timestamp": expense_time}
+
+    if creds:
+        return append_expense_to_sheet(creds, sender_number, expense_data)
+    else:
+        expense_data["timestamp"] = expense_time.isoformat()
+        users_collection.update_one({"_id": sender_number}, {"$push": {"expenses": expense_data}}, upsert=True)
+        log_message = f"✅ Logged locally: *₹{amount:.2f}* for *{item.title()}*"
+        if place and place != "N/A": log_message += f" at *{place.title()}*"
+        log_message += "\n\n💡 Connect your Google Account to log expenses to a live Google Sheet!"
+        return log_message
+
+def export_expenses_to_excel(sender_number, user_data):
+    user_expenses = user_data.get("expenses", []) if user_data else []
+    if not user_expenses: return None
+    df = pd.DataFrame(user_expenses)
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df['Date'] = df['timestamp'].dt.strftime('%Y-%m-%d')
+    df['Time'] = df['timestamp'].dt.strftime('%I:%M %p')
+    df = df[['Date', 'Time', 'item', 'place', 'cost']]
+    df.rename(columns={'item': 'Item', 'place': 'Place', 'cost': 'Cost (₹)'}, inplace=True)
+    file_path = os.path.join("uploads", f"expenses_{sender_number}.xlsx")
+    df.to_excel(file_path, index=False, engine='openpyxl')
+    return file_path
+
+# === UPDATED DAILY BRIEFING FUNCTIONS ===
+def send_daily_briefing():
+    print(f"--- Running Daily Briefing Job at {datetime.now()} ---")
+    all_users = list(get_all_users_from_db())
+    if not all_users:
+        print("No users found. Skipping job."); return
+
+    festival = get_indian_festival_today()
+    quote, author = get_daily_quote()
+    history_events = get_on_this_day_in_history()
+    
+    print(f"Found {len(all_users)} user(s) to send briefing to.")
+    for user in all_users:
+        user_id, user_name, user_location = user["_id"], user.get("name", "there"), user.get("location", "Vijayawada")
+        weather_data = get_raw_weather_data(city=user_location)
+        
+        briefing_content = generate_full_daily_briefing(user_name, festival, quote, author, history_events, weather_data)
+        
+        components = [
+            {"type": "header", "parameters": [{"type": "text", "text": briefing_content.get("greeting", "Good Morning!")}]},
+            {"type": "body", "parameters": [
+                {"type": "text", "text": quote},
+                {"type": "text", "text": author},
+                {"type": "text", "text": briefing_content.get("detailed_history", "N/A")},
+                {"type": "text", "text": briefing_content.get("detailed_weather", "N/A")}
+            ]}
+        ]
+        
+        send_template_message(user_id, "daily_briefing_v3", components)
+        time.sleep(1)
+    print("--- Daily Briefing Job Finished ---")
+
+def send_test_briefing(developer_number):
+    print(f"--- Running Test Briefing for {developer_number} ---")
+    user = get_user_from_db(developer_number)
+    if not user:
+        send_message(developer_number, "Could not send test briefing. Your user profile was not found in the database."); return
+
+    festival, (quote, author), history_events = get_indian_festival_today(), get_daily_quote(), get_on_this_day_in_history()
+    user_name, user_location = user.get("name", "Developer"), user.get("location", "Vijayawada")
+    weather_data = get_raw_weather_data(city=user_location)
+
+    briefing_content = generate_full_daily_briefing(user_name, festival, quote, author, history_events, weather_data)
+    
+    components = [
+        {"type": "header", "parameters": [{"type": "text", "text": briefing_content.get("greeting", "Good Morning!")}]},
+        {"type": "body", "parameters": [
+            {"type": "text", "text": quote},
+            {"type": "text", "text": author},
+            {"type": "text", "text": briefing_content.get("detailed_history", "N/A")},
+            {"type": "text", "text": briefing_content.get("detailed_weather", "N/A")}
+        ]}
+    ]
+    
+    send_template_message(developer_number, "daily_briefing_v3", components)
+    print("--- Test Briefing Finished ---")
+
+def send_update_notification_to_all_users(feature_list):
+    if not ADMIN_SECRET_KEY:
+        print("ADMIN_SECRET_KEY is not set. Cannot send notifications."); return
+    print("--- Sending update notifications to all users ---")
+    all_users = list(get_all_users_from_db())
+    if not all_users:
+        print("No users found, skipping notifications."); return
+
+    components = [{"type": "body", "parameters": [{"type": "text", "text": feature_list}]}]
+    print(f"Found {len(all_users)} user(s). Preparing to send update templates...")
+    for user in all_users:
+        send_template_message(user["_id"], "bot_update_notification", components)
+        time.sleep(1)
+    print("--- Finished sending update notifications ---")
+
+if __name__ == '__main__':
+    if not scheduler.get_job('daily_briefing_job'):
+        scheduler.add_job(func=send_daily_briefing, trigger='cron', hour=8, minute=0, id='daily_briefing_job', replace_existing=True)
+    
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)

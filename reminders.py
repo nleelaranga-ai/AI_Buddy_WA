@@ -1,0 +1,166 @@
+# reminders.py
+from datetime import datetime, timedelta
+from dateutil import parser as date_parser
+from dateutil.relativedelta import relativedelta
+import pytz
+from messaging import send_template_message
+from google_calendar_integration import create_google_calendar_event
+import re
+import time
+
+def get_all_reminders(user, scheduler):
+    """
+    Fetches all scheduled jobs for a specific user and returns a structured list of dictionaries.
+    """
+    user_jobs = [job for job in scheduler.get_jobs() if job.id.startswith(f"reminder_{user}")]
+
+    if not user_jobs:
+        return []
+
+    # Hardcoded Timezone as requested
+    tz = pytz.timezone('Asia/Kolkata')
+    reminders_list = []
+
+    for job in user_jobs:
+        try:
+            task = job.args[2][0]['parameters'][0]['text']
+            next_run = job.next_run_time.astimezone(tz).strftime('%a, %b %d at %I:%M %p')
+            
+            is_recurring = "Recurring" if hasattr(job.trigger, 'start_date') or type(job.trigger).__name__ == 'CronTrigger' else "One-Time"
+
+            reminders_list.append({
+                "id": job.id,
+                "task": task,
+                "next_run": next_run,
+                "type": is_recurring
+            })
+        except (IndexError, KeyError, AttributeError):
+            continue
+
+    return reminders_list
+
+def delete_reminder(job_id, scheduler):
+    """
+    Removes a specific job from the scheduler by its ID.
+    """
+    try:
+        scheduler.remove_job(job_id)
+        return True
+    except Exception as e:
+        print(f"Error removing job {job_id}: {e}")
+        return False
+
+
+def parse_recurrence_to_cron(recurrence_rule, start_time):
+    """
+    Converts a natural language recurrence rule into cron arguments for apscheduler.
+    """
+    if not recurrence_rule:
+        return None
+
+    rule_lower = recurrence_rule.lower()
+    cron_args = {}
+
+    # FIX: Added 'everyday' and 'daily' to the check for robustness
+    if any(x in rule_lower for x in ['every day', 'everyday', 'daily']):
+        cron_args['hour'] = start_time.hour
+        cron_args['minute'] = start_time.minute
+        
+    # FIX: Added 'weekly' check
+    elif any(x in rule_lower for x in ['every week', 'weekly']) or any(day in rule_lower for day in ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']):
+        cron_args['day_of_week'] = start_time.weekday()
+        cron_args['hour'] = start_time.hour
+        cron_args['minute'] = start_time.minute
+        
+    # FIX: Added 'monthly' check
+    elif any(x in rule_lower for x in ['every month', 'monthly']):
+        day_match = re.search(r'(\d+)(?:st|nd|rd|th)?', rule_lower)
+        if day_match:
+            cron_args['day'] = int(day_match.group(1))
+        else:
+            cron_args['day'] = start_time.day
+        cron_args['hour'] = start_time.hour
+        cron_args['minute'] = start_time.minute
+    
+    return cron_args if cron_args else None
+
+
+def schedule_reminder(task, timestamp, recurrence_rule, user, get_creds_func, scheduler):
+    """
+    Schedules a one-time or recurring reminder using a pre-parsed timestamp.
+    """
+    if not timestamp:
+        return "❌ I couldn't understand the time for the reminder. Please try being more specific."
+
+    # Task is now provided directly by the AI, so no more manual extraction.
+    if not task:
+        task = "Reminder" # Fallback if the AI fails to extract a task.
+
+    try:
+        # The timestamp is expected in 'YYYY-MM-DD HH:MM:SS' format from the AI
+        start_time = date_parser.parse(timestamp)
+        
+        # Hardcoded Timezone as requested
+        tz = pytz.timezone('Asia/Kolkata')
+
+        if start_time.tzinfo is None:
+            start_time = tz.localize(start_time)
+
+        now = datetime.now(tz)
+        
+        template_name = "reminder_alert"
+        # The task is already clean, so we can use it directly.
+        components = [{"type": "body", "parameters": [{"type": "text", "text": task.capitalize()}]}]
+        
+        job_id = f"reminder_{user}_{int(time.time())}"
+        
+        cron_args = parse_recurrence_to_cron(recurrence_rule, start_time)
+        job = None
+        base_confirmation = ""
+
+        if cron_args:
+            job = scheduler.add_job(
+                func=send_template_message,
+                trigger='cron',
+                args=[user, template_name, components],
+                id=job_id,
+                replace_existing=True,
+                **cron_args
+            )
+            next_run = job.next_run_time.astimezone(tz).strftime('%A, %b %d at %I:%M %p')
+            base_confirmation = f"✅ Recurring reminder set for '{task}' ({recurrence_rule}).\n\nThe next one is on *{next_run}*."
+        else:
+            # The AI should have already resolved past times, but this is a good safeguard.
+            if start_time < now:
+                 return f"❌ The time you provided ({start_time.strftime('%A, %b %d at %I:%M %p')}) is in the past."
+            
+            job = scheduler.add_job(
+                func=send_template_message,
+                trigger='date',
+                run_date=start_time,
+                args=[user, template_name, components],
+                id=job_id,
+                replace_existing=True
+            )
+            base_confirmation = f"✅ Reminder set for '{task}' on {start_time.strftime('%A, %b %d at %I:%M %p')}."
+
+        gcal_confirmation = ""
+        event_link_text = ""
+        creds = get_creds_func(user)
+        if creds:
+            gcal_first_run = job.next_run_time if job else start_time
+            gcal_message, event_link = create_google_calendar_event(creds, task, gcal_first_run)
+            gcal_confirmation = f"\n{gcal_message}"
+            if event_link:
+                event_link_text = f"\n\n🔗 View Event: {event_link}"
+        else:
+            gcal_confirmation = "\n\n💡 Connect your Google Account to also save reminders to your calendar!"
+
+        return f"{base_confirmation}{gcal_confirmation}{event_link_text}"
+
+    except date_parser.ParserError:
+        # This error is now much less likely.
+        return f"❌ Sorry, I received an invalid date and time format: '{timestamp}'. Please try rephrasing."
+    except Exception as e:
+        print(f"Reminder scheduling error: {e}")
+        return "❌ An unexpected error occurred while setting your reminder."
